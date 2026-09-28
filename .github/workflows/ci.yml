@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Linux only for now: the kqueue / evport / wepoll / IOCP backends are not yet
+  # verified on real macOS / BSD / Solaris / Windows hardware, so adding jobs for
+  # them would report red for reasons unrelated to a change. See README "Platform
+  # support" and PLAN.md for the verification status.
+  linux:
+    name: linux · ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimal
+            cc: gcc
+            opts: ""
+          - name: http + workpool (gcc)
+            cc: gcc
+            opts: "-DMINICONET_WITH_HTTP_PARSER=ON -DMINICONET_WITH_WORKPOOL=ON"
+          - name: http + workpool (clang)
+            cc: clang
+            opts: "-DMINICONET_WITH_HTTP_PARSER=ON -DMINICONET_WITH_WORKPOOL=ON"
+          - name: openssl + uds
+            cc: gcc
+            opts: "-DMINICONET_WITH_OPENSSL=ON -DMINICONET_ENABLE_UDS=ON -DMINICONET_WITH_HTTP_PARSER=ON"
+          - name: io_uring
+            cc: gcc
+            opts: "-DMINICONET_WITH_IO_URING=ON -DMINICONET_WITH_HTTP_PARSER=ON"
+          - name: asan + ubsan
+            cc: gcc
+            opts: "-DMINICONET_WITH_HTTP_PARSER=ON -DMINICONET_ENABLE_SANITIZERS=ON"
+            sanitizer: "1"
+
+    env:
+      CC: ${{ matrix.cc }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang libssl-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja ${{ matrix.opts }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        env:
+          # The sanitizer build needs this on some setups; harmless elsewhere.
+          ASAN_OPTIONS: ${{ matrix.sanitizer && 'verify_asan_link_order=0' || '' }}
+        run: ctest --test-dir build --output-on-failure -j2

@@ -1,0 +1,28 @@
+# ---- build directories ----
+build/
+build*/
+buildDebug/
+buildRelease/
+
+# ---- editor / IDE ----
+.vscode/
+.idea/
+*.swp
+
+# ---- CMake in-source artifacts ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# ---- clangd / language server ----
+.cache/
+
+# ---- objects / logs ----
+*.o
+*.obj
+*.log

@@ -1,0 +1,41 @@
+/*
+ * miniconet_config.h.in — template for this project's feature switches
+ * (cmake/PlatformConfig.cmake). Mirrors the option() calls in CMakeLists.txt and
+ * replaces scattered target_compile_definitions(...), so lib, test and examples
+ * always see identical values.
+ * Same contract as hconfig.h: always 0/1 — use #if, never #ifdef/#ifndef.
+ */
+#ifndef MINICONET_CONFIG_H_
+#define MINICONET_CONFIG_H_
+
+/* io_uring engine backend (Linux). Default when enabled; falls back to epoll if
+ * the runtime probe fails (old kernel / seccomp). */
+#cmakedefine01 MINICONET_WITH_IO_URING
+
+#cmakedefine01 MINICONET_WITH_IOCP
+
+/* multi-vCPU workpool (N OS threads, one vcpu each + a cross-thread queue) */
+#cmakedefine01 MINICONET_WITH_WORKPOOL
+
+/* vendor modules (all off by default, see the options in CMakeLists.txt) */
+#cmakedefine01 MINICONET_WITH_PROTOCOL_CLIENTS
+#cmakedefine01 MINICONET_WITH_HTTP_PARSER
+#cmakedefine01 MINICONET_WITH_MQTT_PROTOCOL
+#cmakedefine01 MINICONET_WITH_MINIUPNP
+#cmakedefine01 MINICONET_WITH_KCP
+#cmakedefine01 MINICONET_WITH_CRYPTO_UTILS
+#cmakedefine01 MINICONET_WITH_IDNA
+#cmakedefine01 MINICONET_WITH_WRAPPER_UTILS
+#cmakedefine01 MINICONET_WITH_UPNP_CLIENT
+
+/* test-only internal accessors (not a stable API). The macro is
+ * MINICONET_TEST_HOOKS while the CMake option is MINICONET_BUILD_TEST_HOOKS. */
+#cmakedefine01 MINICONET_TEST_HOOKS
+
+/* Whether this build has a real TLS backend. Not the same as a
+ * MINICONET_WITH_XXXSSL option, which may be downgraded when the library is
+ * missing; this is the post-downgrade result. The concrete backend is in
+ * WITH_OPENSSL / WITH_MBEDTLS / WITH_GNUTLS / WITH_WINTLS. */
+#cmakedefine01 MINICONET_HAVE_SSL
+
+#endif /* MINICONET_CONFIG_H_ */

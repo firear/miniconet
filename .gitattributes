@@ -1,0 +1,8 @@
+# Normalize text files to LF in the repository; leave binaries alone.
+* text=auto
+
+# Binaries (Windows import libraries and test certificates)
+*.lib  binary
+*.Lib  binary
+*.crt  binary
+*.key  binary

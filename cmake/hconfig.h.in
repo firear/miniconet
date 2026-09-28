@@ -1,0 +1,52 @@
+/*
+ * hconfig.h.in — template for the platform/feature detection results
+ * (cmake/PlatformConfig.cmake).
+ *  1. Generated into the build dir, never written back to the source tree.
+ *  2. All #cmakedefine01: every macro is always 0 or 1, so use #if HAVE_XXX —
+ *     never #ifdef/#ifndef.
+ *  3. Only the macros compat/ and core/ actually test; chv's own switches map to
+ *     our MINICONET_* in miniconet_config.h.
+ * A misspelled name silently evaluates to 0 in #if, so every name is centralized
+ * here — change the detection list in PlatformConfig.cmake together with it.
+ */
+#ifndef HV_CONFIG_H_
+#define HV_CONFIG_H_
+
+/* ---- headers ---- */
+#cmakedefine01 HAVE_STDBOOL_H
+#cmakedefine01 HAVE_STDINT_H
+#cmakedefine01 HAVE_INTTYPES_H
+#cmakedefine01 HAVE_STDATOMIC_H
+#cmakedefine01 HAVE_SYS_TYPES_H
+#cmakedefine01 HAVE_SYS_STAT_H
+#cmakedefine01 HAVE_SYS_TIME_H
+#cmakedefine01 HAVE_FCNTL_H
+#cmakedefine01 HAVE_PTHREAD_H
+#cmakedefine01 HAVE_ENDIAN_H
+#cmakedefine01 HAVE_SYS_ENDIAN_H
+#cmakedefine01 HAVE_BYTESWAP_H
+#cmakedefine01 HAVE_IFADDRS_H
+
+/* Unix Domain Socket（mco_tcp_listen_unix / mco_tcp_connect_unix）。
+ *
+ * Lives here, not in miniconet_config.h: the vendored hsocket.h/c switch UDS with
+ * #if ENABLE_UDS and reach this file via hplatform.h, so the vendor code needs no
+ * change. The name ENABLE_UDS is kept as in the vendor tree. */
+#cmakedefine01 ENABLE_UDS
+
+/* ---- functions ---- */
+#cmakedefine01 HAVE_STRLCPY
+#cmakedefine01 HAVE_STRLCAT
+#cmakedefine01 HAVE_CLOCK_GETTIME
+#cmakedefine01 HAVE_GETTIMEOFDAY
+#cmakedefine01 HAVE_PTHREAD_SPIN_LOCK
+#cmakedefine01 HAVE_PTHREAD_MUTEX_TIMEDLOCK
+#cmakedefine01 HAVE_SEM_TIMEDWAIT
+#cmakedefine01 HAVE_PIPE
+#cmakedefine01 HAVE_SOCKETPAIR
+#cmakedefine01 HAVE_EVENTFD
+#cmakedefine01 HAVE_SETPROCTITLE
+#cmakedefine01 HAVE_GETTID
+#cmakedefine01 HAVE_SCHED_GETCPU
+
+#endif /* HV_CONFIG_H_ */
