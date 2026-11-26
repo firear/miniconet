@@ -1,6 +1,7 @@
 /*
  * upnp_smoke.c — UPnP IGD client smoke test, staged like PLAN Step 3/4/5:
- *   Step 3: SSDP response parsing + new/free + discover timeout
+ *   Step 3: SSDP response parsing + new/free + discover returns (timeout OR a
+ *           usable gateway — depends on the network)
  *   Step 4: device description XML fetch + IGD parse (local TCP fake gateway)
  *   Step 5: SOAP request + response parse (same fake gateway gains a SOAP route)
  * No real UDP multicast (CI containers block it, port 1900 is unreliable): SSDP
@@ -188,14 +189,21 @@ static void client_task(void* arg) {
         if (rc != 0) printf("[parse] non-IGD correctly rejected\n");
     }
 
-    /* 3) discover timeout with no gateway */
+    /* 3) discover must return promptly and consistently: with no gateway it
+     * times out (rc<0); on a network that does have a UPnP IGD it succeeds
+     * (rc>=0) and must then expose a usable control_url. Both are valid, so
+     * assert only that the call completes and that a reported gateway is real
+     * (the old test assumed "no gateway" and failed on hosts that have one). */
     upnp = mco_upnp_new();
     rc = mco_upnp_discover(upnp, 600);
     if (rc < 0) {
         g_discover_timeout_ok = 1;
         printf("[discover] no gateway rc=%d (expected <0)\n", rc);
+    } else if (upnp->control_url[0] != '\0') {
+        g_discover_timeout_ok = 1;
+        printf("[discover] gateway found ctl=%s (usable)\n", upnp->control_url);
     } else {
-        printf("[discover] unexpected success rc=%d\n", rc);
+        printf("[discover] rc=%d but no control_url (invalid gateway)\n", rc);
     }
     mco_upnp_free(upnp);
 

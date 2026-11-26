@@ -101,7 +101,16 @@ int main(void) {
     ok &= run_one("iocp",   mco_engine_iocp_ops());
   #endif
 #else
-    ok &= run_one("epoll",  mco_engine_default());
+  #if defined(__linux__)
+    ok &= run_one("epoll",  mco_engine_epoll_ops());
+  #else
+    /* No epoll here: run this platform's native backend, labelled with the
+     * name the ops table reports instead of a hardcoded "epoll". */
+    {
+        const mco_engine_ops_t* native = mco_engine_default();
+        ok &= run_one(native->name, native);
+    }
+  #endif
     ok &= run_one("select", mco_engine_select_ops());
     ok &= run_one("poll",   mco_engine_poll_ops());
   #if MINICONET_WITH_IO_URING && defined(__linux__)

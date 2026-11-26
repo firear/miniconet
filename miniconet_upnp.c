@@ -257,8 +257,11 @@ static int upnp_soap_request(mco_upnp_t* upnp, const char* action,
                         params ? params : "", action);
     if (body_len < 0 || body_len >= (int)sizeof(body)) return MCO_ERR_IO;
 
-    snprintf(soap_action, sizeof(soap_action), "\"%s#%s\"",
-             upnp->service_type, action);
+    {
+        int sa_len = snprintf(soap_action, sizeof(soap_action), "\"%s#%s\"",
+                              upnp->service_type, action);
+        if (sa_len < 0 || sa_len >= (int)sizeof(soap_action)) return MCO_ERR_IO;
+    }
     extra.name = "SOAPAction";
     extra.value = soap_action;
 

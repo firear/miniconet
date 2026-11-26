@@ -5,9 +5,8 @@
  * straight-line handshake; both directions need two coroutines joined by a
  * waitgroup; EOF only does shutdown(WR) half-close; connect failures map to REP
  * via mco_tcp_connect()'s out_errno.
- * Protocol constants are defined locally on purpose: reusing a vendor SOCKS5
- * header would pull in GPL-licensed code and MSVC-incompatible
- * __attribute__((packed)) structs, and only covers the fixed 4-byte header.
+ * Protocol constants are local: compat/protocol/socks5.h is GPL vendor code using
+ * __attribute__((packed)) (fails on MSVC) and covers only the fixed 4-byte header.
  * Usage:
  *   ./socks5_server [-l 1080] [-b 0.0.0.0] [-t 10000] [-H 10000] [-i 300000] [-c 1024] [-v]
  *   curl -x socks5h://127.0.0.1:1080 http://example.com/
@@ -15,7 +14,9 @@
  * Warning: no access control — do not expose it publicly (open proxy).
  */
 #include "../miniconet.h"
+#include "core/mco_vcpu.h"
 #include "core/mco_waitgroup.h"
+#include "core/mco_timer.h"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>

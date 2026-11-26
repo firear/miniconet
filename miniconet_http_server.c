@@ -1209,8 +1209,8 @@ static int serve_file_content(mco_http_response_t* resp, const char* full,
     return 0;
 }
 
-/* ---- static file route: registers a "GET <prefix>*" route and maps the rest
- * under root_dir with ".." guarded; userdata is the embedded route ctx. ---- */
+/* ---- static file route: registers "prefix/*" and maps the rest under root_dir
+ * with ".." guarded; userdata is the embedded route ctx. ---- */
 
 static void static_file_handler(mco_http_request_t* req, mco_http_response_t* resp, void* userdata) {
     static_route_t* sr = (static_route_t*)userdata;

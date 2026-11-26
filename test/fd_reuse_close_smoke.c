@@ -10,6 +10,7 @@
  * slot forces a kernel resync. Covers epoll/select/poll.
  */
 #include "../miniconet.h"
+#include "../core/mco_vcpu.h"
 #include "../core/mco_engine_backends.h"
 #include <stdio.h>
 #include <string.h>
@@ -147,7 +148,16 @@ int main(void) {
     int ok = 1;
     g_port_cl = 17470;
 
-    ok &= run_one("epoll",  mco_engine_default());
+#if defined(__linux__)
+    ok &= run_one("epoll",  mco_engine_epoll_ops());
+#else
+    /* No epoll here (Windows: wepoll/iocp, BSD: kqueue): run this platform's
+     * native backend under the name its ops table reports. */
+    {
+        const mco_engine_ops_t* native = mco_engine_default();
+        ok &= run_one(native->name, native);
+    }
+#endif
 #if !defined(_WIN32)
     ok &= run_one("select", mco_engine_select_ops());
     ok &= run_one("poll",   mco_engine_poll_ops());

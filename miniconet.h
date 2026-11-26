@@ -9,7 +9,7 @@
 #define MINICONET_H
 
 #include "compat/hsocket.h"
-#include "core/mco_vcpu.h"
+// #include "core/mco_timer.h"
 #ifdef MINICONET_HAVE_GENERATED_CONFIG
 #include "miniconet_generated/miniconet_config.h"
 #else
@@ -22,10 +22,12 @@ extern "C" {
 
 typedef struct mco_socket mco_socket_t;
 
+#define MCO_ERR_TIMEOUT  (-1)
+#define MCO_ERR_CLOSED   (-2)   /* fd closed or cancelled */
+#define MCO_ERR_IO       (-3)   /* kept in sync with miniconet.h */
 #define MCO_ERR_IO       (-3)   /* real syscall error; check errno */
 #define MCO_ERR_BUSY     (-4)   /* a coroutine already waits on that direction */
 #define MCO_ERR_ADDR     (-5)   /* address resolve/bind failed */
-/* MCO_ERR_TIMEOUT(-1) / MCO_ERR_CLOSED(-2) are in mco_vcpu.h */
 
 /* ---- connect failure classes (out_errno of mco_tcp_connect()) ----
  * Only what callers treat differently: SOCKS5 maps them to REP (refused=5 /
@@ -41,11 +43,22 @@ typedef struct mco_socket mco_socket_t;
 #define MCO_CONNECT_IO        7  /* other syscall error; errno is valid */
 
 /* ---- coroutines / event loop (thin wrappers over core/mco_vcpu) ---- */
-typedef mco_vcpu_t mco_loop_t;
-
+typedef struct mco_vcpu mco_loop_t;
+typedef struct mco_task mco_task_t;
 mco_loop_t* mco_loop_new(void);
 void        mco_loop_run(mco_loop_t* loop);
+/* Ask mco_loop_run() to return at the next scheduler turn.
+ * Safe from a coroutine or another thread; it wakes a poll()-blocked loop, so a
+ * loop parked on a long timer exits at once instead of waiting that timer out.
+ *
+ * Coroutines still parked when the loop returns are NOT resumed afterwards.
+ * mco_loop_free() reclaims their stacks and task structs, so stopping
+ * mid-flight is leak-free; it is not a drain — use mco_waitgroup when the
+ * in-flight work must finish first. */
 void        mco_loop_stop(mco_loop_t* loop);
+/* Destroy the loop and reclaim every coroutine it still owns, including the
+ * ones mco_loop_stop() abandoned. An abandoned coroutine is destroyed without
+ * running its cleanup code. */
 void        mco_loop_free(mco_loop_t* loop);
 
 mco_task_t* mco_spawn(mco_loop_t* loop, void (*fn)(void* arg), void* arg);
@@ -76,6 +89,30 @@ mco_socket_t* mco_socket_adopt_fd(int fd);
  * out_errno may be NULL; otherwise the failure class (MCO_CONNECT_*) is written
  * there. */
 mco_socket_t* mco_tcp_connect(const char* host, int port, int timeout_ms, int* out_errno);
+
+/* ---- Composable setup ----
+ * mco_tcp_connect() is socket+connect in one call; these split it so the caller
+ * can bind a fixed local port first (what TCP hole punching needs):
+ *   mco_socket_t* s = mco_tcp_socket(AF_INET);
+ *   mco_socket_bind(s, NULL, 5000);
+ *   mco_socket_connect(s, peer_ip, 5000, 3000, &e); */
+
+/* Create an unconnected, unbound TCP socket. family 0 = AF_INET. No resolution
+ * and no blocking. NULL on failure. */
+mco_socket_t* mco_tcp_socket(int family);
+
+/* Bind to host:port. host NULL/"" = any address in the socket's own family,
+ * otherwise an address literal (no name resolution). Sets SO_REUSEADDR and, for
+ * a fixed port, SO_REUSEPORT so two sockets can share it. port 0 = ephemeral.
+ * 0 on success, <0 = MCO_ERR_* with errno valid. */
+int mco_socket_bind(mco_socket_t* s, const char* host, int port);
+
+/* Connect a socket made by mco_tcp_socket() (async resolution, coroutine-only).
+ * timeout_ms covers resolve + connect; out_errno gets MCO_CONNECT_*. The socket
+ * family must match the resolved address. 0 = connected, <0 = MCO_ERR_*; the
+ * socket stays valid on failure. */
+int mco_socket_connect(mco_socket_t* s, const char* host, int port, int timeout_ms,
+                       int* out_errno);
 
 /* >=0 = bytes transferred (0 = EOF), <0 = MCO_ERR_*. */
 int mco_read(mco_socket_t* s, void* buf, int len, int timeout_ms);

@@ -23,9 +23,17 @@ typedef struct mco_ws mco_ws_t;
 #define MCO_WS_TEXT   1
 #define MCO_WS_BINARY 2
 
-/* Connect + send the Upgrade request + check Sec-WebSocket-Accept. timeout_ms
- * covers connect + handshake. NULL on failure. Coroutine-only. */
+/* Connect + handshake over plain TCP; timeout_ms covers both. NULL on failure.
+ * Coroutine-only. For wss build the connection yourself, then handshake:
+ *   mco_socket_t* s = mco_tls_connect(host, 443, ctx, 3000, NULL);
+ *   mco_ws_t* ws = mco_ws_client_handshake(s, host, 443, "/ws", 3000); */
 mco_ws_t* mco_ws_connect(const char* host, int port, const char* path, int timeout_ms);
+
+/* Client handshake on a connected socket (TCP or TLS): sends the Upgrade
+ * request, checks Sec-WebSocket-Accept. Takes ownership of sock (closed and
+ * destroyed on failure). NULL on failure. Coroutine-only. */
+mco_ws_t* mco_ws_client_handshake(mco_socket_t* sock, const char* host, int port,
+                                  const char* path, int timeout_ms);
 
 /* Server handshake on a connection that already received a valid Upgrade
  * request: computes Accept from the client key and replies 101. leftover holds

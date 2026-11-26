@@ -16,23 +16,6 @@ const char* hssl_backend() {
 }
 
 
-static void setopt(SSL_CTX *sslctx)
-{
-    SSL_CTX_set_options(sslctx, SSL_OP_ALL);
-#ifdef SSL_OP_TLS_ROLLBACK_BUG
-       SSL_CTX_set_options(sslctx, SSL_OP_TLS_ROLLBACK_BUG);
-#endif /* SSL_OP_TLS_ROLLBACK_BUG */
-#ifdef SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION
-       SSL_CTX_set_options(sslctx, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
-#endif /* SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION */
-#ifdef SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
-       SSL_CTX_set_options(sslctx, SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS);
-#endif /* SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS */
-#ifdef SSL_OP_NO_TICKET
-       SSL_CTX_set_options(sslctx, SSL_OP_NO_TICKET);
-#endif /* SSL_OP_NO_TICKET */
-
-}
 static int verify_callback(int preverify_ok, X509_STORE_CTX* x509_store_ctx)
 {
     int error_code = preverify_ok ? X509_V_OK : X509_STORE_CTX_get_error(x509_store_ctx);
@@ -227,6 +210,18 @@ int hssl_close(hssl_t ssl) {
 int hssl_set_sni_hostname(hssl_t ssl, const char* hostname) {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
     SSL_set_tlsext_host_name((SSL*)ssl, hostname);
+#endif
+    /* Also pin the expected peer hostname so the certificate is checked
+     * against it during verification (SNI alone does not verify the name).
+     * Requires the ctx to have been created with verify_peer=1. */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    SSL_set1_host((SSL*)ssl, hostname);
+#elif defined(X509_V_ERR_HOSTNAME_MISMATCH)
+    {
+        X509_VERIFY_PARAM* param = SSL_get0_param((SSL*)ssl);
+        X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        X509_VERIFY_PARAM_set1_host(param, hostname, 0);
+    }
 #endif
     return 0;
 }

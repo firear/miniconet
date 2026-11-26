@@ -48,6 +48,12 @@ typedef struct mco_task {
 
     /* Embedded wait timer node, reused serially by wait_io/sleep. */
     mco_timer_t        wait_timer_obj;
+
+    /* Intrusive list of every live task on this vcpu. Doubly linked so a task
+     * can unlink itself in O(1) when it finishes; mco_vcpu_free() walks it to
+     * reclaim coroutines left parked by mco_vcpu_stop(). */
+    struct mco_task*   live_prev;
+    struct mco_task*   live_next;
 } mco_task_t;
 
 /* io wait kinds (wait_kind).
@@ -61,6 +67,8 @@ typedef struct mco_task {
 #define MCO_ERR_TIMEOUT  (-1)
 #define MCO_ERR_CLOSED   (-2)   /* fd closed or cancelled */
 #define MCO_ERR_IO       (-3)   /* kept in sync with miniconet.h */
+#define MCO_ERR_BUSY     (-4)   /* resource busy / would block (kept in sync) */
+#define MCO_ERR_ADDR     (-5)   /* bad address or calling context (kept in sync) */
 
 /* Current thread's vcpu; lazily created with the default engine. */
 mco_vcpu_t* mco_vcpu_current(void);
@@ -104,6 +112,12 @@ mco_task_t* mco_task_self(void);
 /* Wait for events or timeout_ms (<0 = none). Returns the MCO_EV_* mask, or
  * MCO_ERR_TIMEOUT/MCO_ERR_CLOSED. */
 int  mco_wait_io(int fd, int events, int timeout_ms);
+
+/* 1 when the current vcpu's engine can submit completion-style read/write
+ * (io_uring, IOCP) and its runtime probe agrees. 0 for readiness-only engines
+ * (epoll/kqueue/select) and outside a coroutine, where mco_read/mco_write must
+ * keep the speculative syscall path. */
+int  mco_engine_completion_io(void);
 
 /* ---- Completion-style io (io_uring fast path, else readiness + syscall).
  * timeout_ms==0 returns timeout at once: try a non-blocking syscall first. ---- */

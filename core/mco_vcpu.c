@@ -47,6 +47,7 @@ struct mco_vcpu {
     mco_task_t*             ready_tail;
     mco_task_t*             current;   /* task being resumed; NULL outside coroutines */
     mco_task_t*             task_free;  /* dead task struct reuse list */
+    mco_task_t*             live_head;  /* every live task; see mco_task_t.live_next */
     int                     ntasks;    /* live coroutines */
     int                     ntask_free;
     int                     nblocked;   /* coroutines blocked on io/timers */
@@ -94,6 +95,14 @@ static mco_task_t* pop_ready(mco_vcpu_t* vcpu) {
     task->in_ready = 0;
     return task;
 }
+/* Drop a finished task from the live list. O(1) with the prev pointer. */
+static void unlink_live(mco_vcpu_t* vcpu, mco_task_t* task) {
+    if (task->live_prev) task->live_prev->live_next = task->live_next;
+    else if (vcpu->live_head == task) vcpu->live_head = task->live_next;
+    if (task->live_next) task->live_next->live_prev = task->live_prev;
+    task->live_prev = NULL;
+    task->live_next = NULL;
+}
 
 /* ---- coroutine switch (scheduler hot path) ----
  *
@@ -123,6 +132,17 @@ mco_vcpu_t* mco_vcpu_new(const mco_engine_ops_t* ops) {
     if (!vcpu) return NULL;
     vcpu->ops = ops ? ops : mco_engine_default();
     vcpu->engine = vcpu->ops->create();
+    if (!vcpu->engine && !ops) {
+        /* The preferred backend refused to start (io_uring on an old kernel, or
+         * under seccomp). Retry on the readiness backend instead of failing the
+         * whole vcpu. A backend the caller pinned itself is not substituted, so
+         * a test that asks for io_uring really gets io_uring or a failure. */
+        const mco_engine_ops_t* fallback = mco_engine_default_fallback(vcpu->ops);
+        if (fallback && fallback != vcpu->ops) {
+            vcpu->ops = fallback;
+            vcpu->engine = fallback->create();
+        }
+    }
     if (!vcpu->engine) { free(vcpu); return NULL; }
     mco_timer_heap_init(&vcpu->timers);
     vcpu->stack_pool.max_free = MCO_STACK_POOL_DEFAULT_MAX_FREE;
@@ -149,9 +169,32 @@ static void task_pool_drain(mco_vcpu_t* vcpu) {
     vcpu->ntask_free = 0;
 }
 
+/* Reclaim coroutines left parked when mco_vcpu_stop() ended the loop early.
+ * Order matters: the engine is already destroyed, so closing the ring/poll set
+ * cancelled in-flight completions and nothing can write into a stack we are
+ * about to free. Only non-running coroutines can be reached here; the running
+ * one (vcpu->current) is skipped because destroy() would reject it anyway. */
+static void abandon_live_tasks(mco_vcpu_t* vcpu) {
+    mco_task_t* task = vcpu->live_head;
+
+    while (task) {
+        mco_task_t* next = task->live_next;
+        if (task != vcpu->current) {
+            if (mco_timer_active(&task->wait_timer_obj))
+                mco_timer_stop(&vcpu->timers, &task->wait_timer_obj);
+            if (task->co) mco_destroy(task->co); /* stack goes back to the pool */
+            free(task);
+        }
+        task = next;
+    }
+    vcpu->live_head = NULL;
+}
+
 void mco_vcpu_free(mco_vcpu_t* vcpu) {
     if (!vcpu) return;
-    vcpu->ops->destroy(vcpu->engine);
+    vcpu->ops->destroy(vcpu->engine); /* first: cancels io the stacks may still be in */
+    vcpu->engine = NULL;
+    abandon_live_tasks(vcpu);         /* no leak for stop-abandoned coroutines */
     stack_pool_drain(&vcpu->stack_pool); /* free cached stacks to avoid leaks */
     task_pool_drain(vcpu);
     if (g_cur_vcpu == vcpu) g_cur_vcpu = NULL;
@@ -274,6 +317,12 @@ mco_task_t* mco_go(mco_vcpu_t* vcpu, void (*fn)(void* arg), void* arg) {
     task->wait_fd = -1;
 
     vcpu->ntasks++;
+    /* Every live task is also on vcpu->live_head so mco_vcpu_free() can reclaim
+     * what mco_vcpu_stop() abandoned. O(1): push front. */
+    task->live_prev = NULL;
+    task->live_next = vcpu->live_head;
+    if (vcpu->live_head) vcpu->live_head->live_prev = task;
+    vcpu->live_head = task;
     push_ready(vcpu, task);
     return task;
 }
@@ -297,6 +346,7 @@ void mco_vcpu_run(mco_vcpu_t* vcpu) {
             vcpu->current = NULL;
 
             if (task->co->state == MCO_DEAD) {
+                unlink_live(vcpu, task);
                 mco_destroy(task->co);
                 /* recycle the task struct (stack handled by the pool) */
                 if (vcpu->ntask_free < MCO_TASK_POOL_MAX_FREE) {
@@ -407,7 +457,20 @@ static void on_async_complete(void* ud, int fd, int res) {
     task->wait_errno = (res < 0) ? -res : 0;
     task->wait_result = (res >= 0) ? res : MCO_ERR_IO;
 }
+/* Advertise whether mco_read/mco_write may skip the speculative syscall and
+ * submit a completion directly. Both submit callbacks must exist (the ops table
+ * is static, so this is a build-time property) and the engine's runtime probe
+ * must agree (kernels without READ/WRITE+CANCEL report usable == 0). */
+int mco_engine_completion_io(void) {
+    mco_vcpu_t* vcpu = g_cur_vcpu;
+    const struct mco_engine_async_ops* async;
 
+    if (!vcpu || !vcpu->ops || !vcpu->engine) return 0;
+    async = vcpu->ops->async;
+    if (!async || !async->submit_read || !async->submit_write) return 0;
+    if (async->usable && !async->usable(vcpu->engine)) return 0;
+    return 1;
+}
 int mco_wait_io(int fd, int events, int timeout_ms) {
     mco_vcpu_t* vcpu = g_cur_vcpu;
     mco_task_t* task = vcpu->current;
@@ -533,6 +596,16 @@ int mco_wait_send(int fd, const void* buf, int len, int type, int timeout_ms) {
     }
 }
 
+/* An errno that only means "still in flight": io_uring CONNECT to a remote
+ * address completes at once with -EINPROGRESS, so the wait goes on by readiness. */
+static int connect_errno_in_progress(int e) {
+#ifdef OS_WIN
+    return e == WSAEINPROGRESS || e == WSAEALREADY || e == WSAEWOULDBLOCK;
+#else
+    return e == EINPROGRESS || e == EALREADY || e == EAGAIN || e == EWOULDBLOCK;
+#endif
+}
+
 int mco_wait_connect(int fd, const void* addr, unsigned addrlen, int timeout_ms,
                      int* out_errno) {
     mco_vcpu_t* vcpu = g_cur_vcpu;
@@ -547,13 +620,15 @@ int mco_wait_connect(int fd, const void* addr, unsigned addrlen, int timeout_ms,
                                                 on_async_complete, task);
         if (cookie) {
             int r = async_wait_common(vcpu, task, cookie, fd, timeout_ms);
+            int e = task->wait_errno;
             /* Trust the CQE res: io_uring CONNECT does not set sk_err, so
              * SO_ERROR would report a refused connection as success. */
-            if (r >= 0 || task->wait_errno != 0) {
-                if (out_errno) *out_errno = task->wait_errno;
+            if (r >= 0 || (e != 0 && !connect_errno_in_progress(e))) {
+                if (out_errno) *out_errno = e;
                 return 0;
             }
-            return r; /* wait timed out or was cancelled */
+            if (e == 0) return r; /* the wait timed out or was cancelled */
+            /* EINPROGRESS & co: still in flight, wait by readiness instead. */
         }
     }
 

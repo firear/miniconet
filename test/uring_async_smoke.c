@@ -10,6 +10,7 @@
  */
 #include "../miniconet.h"
 #include "../core/mco_engine_backends.h"
+#include "../core/mco_vcpu.h"   /* mco_vcpu_t / mco_vcpu_new for the explicit engine */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

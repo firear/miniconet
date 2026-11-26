@@ -1,4 +1,5 @@
 #include "miniconet.h"
+#include "core/mco_vcpu.h"
 #include "core/mco_resolver.h"
 #include "compat/hsocket.h"
 #include "compat/ssl/hssl.h"
@@ -177,6 +178,23 @@ int mco_read(mco_socket_t* s, void* buf, int len, int timeout_ms) {
         }
     }
 
+    /* Completion-first: on an engine that can submit RECV directly (io_uring,
+     * IOCP) one submit + CQE replaces recv() followed by a readiness re-arm, and
+     * a would-be EAGAIN never costs a syscall. timeout_ms == 0 keeps the
+     * try-once contract of the speculative path (mco_wait_* returns TIMEOUT
+     * without trying), and non-stream fds keep using recvfrom/read. */
+    if (timeout_ms != 0 && s->type == MCO_SOCK_STREAM && mco_engine_completion_io()) {
+        int r;
+        s->rd_waiter = mco_task_self();
+        r = mco_wait_recv(s->fd, buf, len, (int)s->type, timeout_ms);
+        s->rd_waiter = NULL;
+        if (r >= 0) { s->rd_likely = 1; return r; } /* 0 = EOF */
+        if (r == MCO_ERR_TIMEOUT) return MCO_ERR_TIMEOUT;
+        if (r == MCO_ERR_CLOSED) return MCO_ERR_CLOSED;
+        if (r == MCO_ERR_IO) return MCO_ERR_IO;
+        return s->closed ? MCO_ERR_CLOSED : r;
+    }
+
     for (;;) {
         /* Speculative read: a hit saves a yield plus an event round trip, a miss
          * costs one ~300ns syscall. rd_likely only goes back to 1 after the wait
@@ -235,6 +253,20 @@ int mco_write(mco_socket_t* s, const void* buf, int len, int timeout_ms) {
             }
             if (s->closed) { ssl_cross_owner_release(s); return MCO_ERR_CLOSED; }
         }
+    }
+
+    /* Completion-first write: mirror of mco_read. A partial result (0<n<len) is
+     * returned as-is, matching write(); mco_write_all() loops on it. */
+    if (timeout_ms != 0 && s->type == MCO_SOCK_STREAM && mco_engine_completion_io()) {
+        int r;
+        s->wr_waiter = mco_task_self();
+        r = mco_wait_send(s->fd, buf, len, (int)s->type, timeout_ms);
+        s->wr_waiter = NULL;
+        if (r >= 0) { if (r == len) s->wr_likely = 1; return r; }
+        if (r == MCO_ERR_TIMEOUT) return MCO_ERR_TIMEOUT;
+        if (r == MCO_ERR_CLOSED) return MCO_ERR_CLOSED;
+        if (r == MCO_ERR_IO) return MCO_ERR_IO;
+        return s->closed ? MCO_ERR_CLOSED : r;
     }
 
     for (;;) {
@@ -426,27 +458,55 @@ static int classify_connect_errno(int err) {
     }
 }
 
-/* Finish a non-blocking connect (shared by TCP and UDS). fd already had
- * connect() issued (cret is its return value); if unfinished, wait for the
- * outcome and take the real errno (completion path: mco_wait_connect; readiness
- * path: SO_ERROR). Returns the socket, or NULL with fd already closed.
- * addr/addrlen feed the CONNECT fast path; out_errno may be NULL. */
+/* cret is connect()'s return: 0 = go on, <0 = hard failure with out_errno set. */
+static int connect_started(int cret, int* out_errno) {
+    if (cret == 0) return 0;
+    {
+        int e = socket_errno();
+#ifdef OS_WIN
+        if (e != WSAEWOULDBLOCK) {
+#else
+        if (e != EINPROGRESS) {
+#endif
+            if (out_errno) *out_errno = classify_connect_errno(e);
+            return MCO_ERR_IO;
+        }
+        return 0;
+    }
+}
+
+/* Wait for a connect still in flight (shared by TCP and UDS): 0 = connected,
+ * <0 = MCO_ERR_*. The fd stays open either way; the caller closes it on failure. */
+static int finish_connect_wait(int fd, mco_deadline_t dl, const void* addr,
+                               unsigned addrlen, int* out_errno) {
+    int conn_err = 0;
+    int r = mco_wait_connect(fd, addr, addrlen, mco_deadline_ms(dl), &conn_err);
+    int err = conn_err;
+    socklen_t errlen = sizeof(err);
+
+    if (r == MCO_ERR_TIMEOUT || r == MCO_ERR_CLOSED) {
+        if (out_errno) *out_errno = MCO_CONNECT_TIMEOUT;
+        return r;
+    }
+    /* Trust the errno from the CQE: io_uring leaves sk_err unset, so SO_ERROR
+     * would report a false 0. The readiness path uses SO_ERROR. */
+    if (err == 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) != 0) err = socket_errno();
+    if (err != 0) {
+        if (out_errno) *out_errno = classify_connect_errno(err);
+        return MCO_ERR_IO;
+    }
+    return 0;
+}
+
+/* Same, but also wraps fd: the socket, or NULL with fd already closed. */
 static mco_socket_t* finish_nonblocking_connect(int fd, int cret, mco_deadline_t dl,
                                                 const void* addr, unsigned addrlen,
                                                 int* out_errno) {
     mco_socket_t* s;
 
-    if (cret != 0) {
-        int e = socket_errno();
-#ifdef OS_WIN
-        if( e  != WSAEWOULDBLOCK) {
-#else
-        if (e != EINPROGRESS) {
-#endif
-            if (out_errno) *out_errno = classify_connect_errno(e);
-            closesocket(fd);
-            return NULL;
-        }
+    if (connect_started(cret, out_errno) != 0) {
+        closesocket(fd);
+        return NULL;
     }
 
     s = sock_wrap(fd);
@@ -458,25 +518,10 @@ static mco_socket_t* finish_nonblocking_connect(int fd, int cret, mco_deadline_t
 
     if (cret == 0) return s; /* rare: connected immediately (loopback / UDS) */
 
-    {
-        int conn_err = 0;
-        int r = mco_wait_connect(fd, addr, addrlen, mco_deadline_ms(dl), &conn_err);
-        int err = conn_err;
-        socklen_t errlen = sizeof(err);
-
-        if (r == MCO_ERR_TIMEOUT || r == MCO_ERR_CLOSED) {
-            if (out_errno) *out_errno = MCO_CONNECT_TIMEOUT;
-            mco_close(s); mco_socket_destroy(s); return NULL;
-        }
-        /* Trust the errno from the CQE: io_uring leaves sk_err unset, so SO_ERROR
-         * would report a false 0. The readiness path uses SO_ERROR. */
-        if (err == 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) != 0) err = socket_errno();
-        if (err != 0) {
-            if (out_errno) *out_errno = classify_connect_errno(err);
-            mco_close(s); mco_socket_destroy(s); return NULL;
-        }
-        return s; /* connected */
+    if (finish_connect_wait(fd, dl, addr, addrlen, out_errno) != 0) {
+        mco_close(s); mco_socket_destroy(s); return NULL;
     }
+    return s; /* connected */
 }
 
 mco_socket_t* mco_tcp_connect(const char* host, int port, int timeout_ms, int* out_errno) {
@@ -513,8 +558,81 @@ mco_socket_t* mco_tcp_connect(const char* host, int port, int timeout_ms, int* o
     return finish_nonblocking_connect(fd, cret, dl, &addr.sa, (unsigned)sockaddr_len(&addr), out_errno);
 }
 
-/* ---- Unix Domain Socket ---- */
+/* ---- Composable setup: mco_tcp_connect() fixes the order socket -> connect,
+ * these let the caller bind a fixed local port in between (punching). ---- */
 
+mco_socket_t* mco_tcp_socket(int family) {
+    int fd = hsocket(family ? family : AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    return sock_wrap(fd);
+}
+
+int mco_socket_bind(mco_socket_t* s, const char* host, int port) {
+    sockaddr_u addr;
+    sockaddr_u me;
+
+    if (!s || s->fd < 0 || s->closed) return MCO_ERR_CLOSED;
+    if (port < 0 || port > 65535) return MCO_ERR_ADDR;
+
+    memset(&addr, 0, sizeof(addr));
+    if (host && *host) {
+        /* Address literal only: a name would need mco_resolve(). */
+        if (sockaddr_set_ipport(&addr, host, port) != 0) return MCO_ERR_ADDR;
+    } else {
+        /* "any address", keeping the socket's own family */
+        if (mco_socket_local_addr(s, &addr) != 0) addr.sa.sa_family = AF_INET;
+        sockaddr_set_port(&addr, port);
+    }
+    /* Same rejection as mco_socket_connect(): the socket owns the family. */
+    if (mco_socket_local_addr(s, &me) == 0 && me.sa.sa_family != addr.sa.sa_family)
+        return MCO_ERR_ADDR;
+
+    so_reuseaddr(s->fd, 1);
+    /* REUSEPORT only for a fixed port: that is the one that must be shareable. */
+    if (port != 0) so_reuseport(s->fd, 1);
+    if (bind(s->fd, &addr.sa, sockaddr_len(&addr)) != 0) return MCO_ERR_IO;
+    return 0;
+}
+
+int mco_socket_connect(mco_socket_t* s, const char* host, int port, int timeout_ms,
+                       int* out_errno) {
+    mco_deadline_t dl;
+    sockaddr_u addr;
+    sockaddr_u me;
+    int cret;
+
+    if (out_errno) *out_errno = MCO_CONNECT_OK;
+    if (!s || s->fd < 0 || s->closed) {
+        if (out_errno) *out_errno = MCO_CONNECT_IO;
+        return MCO_ERR_CLOSED;
+    }
+    if (!host || port <= 0 || port > 65535) {
+        if (out_errno) *out_errno = MCO_CONNECT_INVALID;
+        return MCO_ERR_ADDR;
+    }
+
+    dl = mco_deadline_after(timeout_ms);
+    memset(&addr, 0, sizeof(addr));
+    if (mco_resolve(host, &addr, mco_deadline_ms(dl)) != MCO_RESOLVE_OK) {
+        if (out_errno) *out_errno = MCO_CONNECT_DNS;
+        return MCO_ERR_ADDR;
+    }
+    sockaddr_set_port(&addr, port);
+
+    /* The socket owns the family; else connect() only reports EINVAL. */
+    if (mco_socket_local_addr(s, &me) == 0 && me.sa.sa_family != addr.sa.sa_family) {
+        if (out_errno) *out_errno = MCO_CONNECT_INVALID;
+        return MCO_ERR_ADDR;
+    }
+
+    cret = connect(s->fd, &addr.sa, sockaddr_len(&addr));
+    if (connect_started(cret, out_errno) != 0) return MCO_ERR_IO;
+    if (cret == 0) return 0;
+    /* The socket survives a failure: close it, or rebind and retry. */
+    return finish_connect_wait(s->fd, dl, &addr.sa, (unsigned)sockaddr_len(&addr), out_errno);
+}
+
+/* ---- Unix Domain Socket ---- */
 mco_socket_t* mco_tcp_listen_unix(const char* path) {
 #if ENABLE_UDS
     int fd = ListenUnix(path);

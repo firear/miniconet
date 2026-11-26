@@ -303,11 +303,18 @@ static int probe_wait_for(mco_uring_engine_t* e, uint64_t cookie, int* out_connf
     }
 }
 
-/* Submit ACCEPT on an idle non-blocking unix listener: it must not complete. */
+/* Submit ACCEPT on a non-blocking unix listener and give it something to
+ * accept. The old version waited out its 30ms timeout to conclude "ACCEPT
+ * parks", which costs every process that much before it serves a first byte.
+ * With a client connecting right after the submit the verdict arrives in
+ * microseconds both ways: a kernel that supports async accept completes with the
+ * new fd, one that does not completes at once with an error. The timeout is now
+ * only a safety net for a connect that never lands. */
 static int probe_accept_support(mco_uring_engine_t* e) {
     struct mco_io_uring_sqe* sqe;
     struct sockaddr_un addr;
-    int slot, lfd, connfd = -1, ok;
+    socklen_t alen;
+    int slot, lfd, cfd = -1, connfd = -1, ok;
 
     lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (lfd < 0) return 0;
@@ -315,8 +322,8 @@ static int probe_accept_support(mco_uring_engine_t* e) {
     addr.sun_family = AF_UNIX;
     addr.sun_path[0] = 0;  /* abstract namespace: no filesystem entry */
     snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1, "mco-probe-a-%d", (int)getpid());
-    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr.sun_family) + 1 + strlen(addr.sun_path + 1)) != 0 ||
-        listen(lfd, 1) != 0) {
+    alen = (socklen_t)(sizeof(addr.sun_family) + 1 + strlen(addr.sun_path + 1));
+    if (bind(lfd, (struct sockaddr*)&addr, alen) != 0 || listen(lfd, 1) != 0) {
         close(lfd);
         return 0;
     }
@@ -334,9 +341,20 @@ static int probe_accept_support(mco_uring_engine_t* e) {
     e->slots[slot].cb = NULL;
     e->slots[slot].ud = NULL;
 
+    /* Give the ACCEPT something to complete on. The connection is already
+     * queued in the backlog when the ring submit happens below, so a kernel that
+     * supports async accept answers at once; one that does not answers at once
+     * with an error. Either way no timeout is burned. */
+    cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (cfd >= 0 && connect(cfd, (struct sockaddr*)&addr, alen) != 0 && errno != EINPROGRESS) {
+        close(cfd);   /* no client: fall back to waiting the timeout out */
+        cfd = -1;
+    }
+
     ok = probe_wait_for(e, async_tag((unsigned)slot, e->slots[slot].gen), &connfd);
     if (e->slots[slot].in_use) slot_release(e, &e->slots[slot]);
     if (connfd >= 0) close(connfd);
+    if (cfd >= 0) close(cfd);
     close(lfd);
     return ok;
 }
@@ -747,12 +765,19 @@ static int uring_submit_cancel(mco_engine_t* eng, uint64_t cookie, void* ud) {
     return 0;
 }
 
+/* Readiness fallback still works when the probe says no, so this only steers
+ * mco_read/mco_write towards submit_read/submit_write. */
+static int uring_async_usable(mco_engine_t* eng) {
+    return ((mco_uring_engine_t*)eng)->has_async;
+}
+
 static const struct mco_engine_async_ops s_uring_async_ops = {
     uring_submit_read,
     uring_submit_write,
     uring_submit_connect,
     uring_submit_accept,
-    uring_submit_cancel
+    uring_submit_cancel,
+    uring_async_usable
 };
 
 static const mco_engine_ops_t s_uring_ops = {

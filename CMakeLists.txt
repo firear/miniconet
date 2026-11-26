@@ -57,15 +57,23 @@ option(MINICONET_WITH_CRYPTO_UTILS
 option(MINICONET_WITH_IDNA
     "vendor 国际化域名支持(idna.c，来自 chv-master util/)，给 mco_resolve() 用" OFF)
 option(MINICONET_WITH_WRAPPER_UTILS
-    "vendor 几个零散工具：动态字节数组(charry.c) + hmemdup，来自 chv-master wrapper/" OFF)
+    "vendor 几个零散工具：动态字节数组(charry.c) + 红黑树 map(rbtree.c+rbmap.c)，来自 chv-master wrapper/" OFF)
 option(MINICONET_WITH_WORKPOOL
     "可选：多 vCPU workpool 薄层(N 个 OS 线程各跑一个 vcpu + 跨线程任务队列)。\
 给默认单 vcpu 模型补真并行能力；默认 OFF，不需要多核并行时不编译。见 core/mco_workpool.h" OFF)
+option(MINICONET_WITH_BLOCKPOOL
+    "可选：阻塞调用卸载池(N 个普通线程执行阻塞函数，协程挂起等待)。\
+用于把文件/阻塞 IO 移出 vcpu，避免卡住事件循环；默认 OFF。见 core/mco_blockpool.h" OFF)
 option(MINICONET_WITH_UPNP_CLIENT
     "可选：UPnP IGD 客户端(协程同步式：SSDP 发现 + 设备描述解析 + SOAP 端口映射控制)。\
 依赖 miniconet2_http_client(用 mco_http_get_ex/mco_http_request) 和 miniconet2_miniupnp。\
 默认 OFF；打开时隐含 MINICONET_WITH_HTTP_PARSER=ON 和 MINICONET_WITH_MINIUPNP=ON。\
 见 miniconet_upnp.h" OFF)
+option(MINICONET_WITH_PMP
+    "可选：NAT-PMP 客户端(RFC 6886，协程同步式：公网地址查询 + 端口映射，\
+重试节奏对齐 libnatpmp)。默认网关探测 vendor 自 libnatpmp getgateway\
+(路由表)，失败回落 openp2p 的 (私网IP&掩码)|1 启发式。默认 OFF；\
+见 miniconet_pmp.h" OFF)
 
 if(WIN32 OR MINGW)
     if(MSVC_VERSION GREATER_EQUAL 1700)
@@ -152,12 +160,23 @@ else()
     list(APPEND MINICONET_CORE_SOURCES core/mco_engine_select.c)  # poll backend is Windows-only
 endif()
 
+if(UNIX)
+    # 网卡枚举（getifaddrs；无 ifaddrs.h 的平台内部自动退化为 ENOSYS 桩）
+    list(APPEND MINICONET_CORE_SOURCES compat/netadapters_linux.c)
+endif()
+
 if(WIN32)
     list(APPEND MINICONET_CORE_SOURCES compat/portable/winapi.c)
+    # 网卡枚举（GetAdaptersAddresses；VC6 经 winapi.c 动态加载，其余直接链接）
+    list(APPEND MINICONET_CORE_SOURCES compat/netadapters_win.c)
 endif()
 
 if(MINICONET_WITH_WORKPOOL)
     list(APPEND MINICONET_CORE_SOURCES core/mco_workpool.c)
+endif()
+
+if(MINICONET_WITH_BLOCKPOOL)
+    list(APPEND MINICONET_CORE_SOURCES core/mco_blockpool.c)
 endif()
 
 add_library(miniconet2 STATIC ${MINICONET_CORE_SOURCES})
@@ -189,17 +208,10 @@ target_compile_definitions(miniconet2
 
 target_compile_options(miniconet2 PRIVATE
     $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall>
+    # -Wno-unused-function     # unused statics in vendor code
     # -Wno-unused-result       # unchecked asprintf() in vendor code
     # -Wno-format-truncation   # false "format may be NULL" in vendor debug.c
 )
-
-# Vendored code carries helpers used only by feature paths we do not enable
-# (e.g. openssl.c's setopt, whose only call site is commented out upstream).
-# Silence -Wall for those files only, so our own sources still report dead code.
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    set_source_files_properties(compat/ssl/openssl.c
-        PROPERTIES COMPILE_FLAGS "-Wno-unused-function")
-endif()
 
 if(UNIX)
     find_package(Threads REQUIRED)
@@ -207,7 +219,8 @@ if(UNIX)
 endif()
 
 if(WIN32)
-    target_link_libraries(miniconet2 PUBLIC ws2_32)
+    # iphlpapi: netadapters_win.c 的 GetAdaptersAddresses（非 VC6 编译器直接链接）
+    target_link_libraries(miniconet2 PUBLIC ws2_32 iphlpapi)
 endif()
 
 # These now come from the generated miniconet_config.h (always 0/1).
@@ -344,6 +357,24 @@ if(MINICONET_WITH_UPNP_CLIENT)
         miniconet2_http_client miniconet2_miniupnp miniconet2)
 endif()
 
+if(MINICONET_WITH_PMP)
+    add_library(miniconet2_pmp STATIC
+        miniconet_pmp.c
+        compat/pmp/getgateway.c
+    )
+    target_include_directories(miniconet2_pmp PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_include_directories(miniconet2_pmp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/compat
+    )
+    # miniconet_pmp.c picks the real impl vs stub via #ifdef
+    target_compile_definitions(miniconet2_pmp PRIVATE MINICONET_WITH_PMP)
+    # getgateway.c(Windows) 的 GetBestRoute 走 miniconet2 已 PUBLIC 链接的 iphlpapi
+    target_link_libraries(miniconet2_pmp PUBLIC miniconet2)
+endif()
+
 if(MINICONET_WITH_KCP)
     add_library(miniconet2_kcp STATIC
         compat/kcp/ikcp.c
@@ -370,6 +401,8 @@ endif()
 if(MINICONET_WITH_WRAPPER_UTILS)
     add_library(miniconet2_wrapper_utils STATIC
         compat/wrapper/charry.c
+        compat/wrapper/rbmap.c
+        compat/rbtree.c
         compat/hmemdup.c
     )
     target_include_directories(miniconet2_wrapper_utils PUBLIC
@@ -409,10 +442,20 @@ if(MINICONET_BUILD_EXAMPLES)
         ${CMAKE_CURRENT_SOURCE_DIR}/test/workpool_inflight_smoke.c
         ${CMAKE_CURRENT_SOURCE_DIR}/test/accept_dispatch_smoke.c
         ${CMAKE_CURRENT_SOURCE_DIR}/test/workpool_backpressure_smoke.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/workpool_try_async_smoke.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/workpool_drain_smoke.c
+    )
+
+    set(MINICONET_BLOCKPOOL_TESTS
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/blockpool_smoke.c
     )
     # needs miniconet2_upnp, only present when UPNP_CLIENT=ON
     set(MINICONET_UPNP_TESTS
         ${CMAKE_CURRENT_SOURCE_DIR}/test/upnp_smoke.c
+    )
+    # needs miniconet2_pmp, only present when PMP=ON
+    set(MINICONET_PMP_TESTS
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/pmp_smoke.c
     )
     # benchmark, not a regression test: registered separately, looser timeout,
     # no sanitizer (throughput under ASan is meaningless).
@@ -425,6 +468,8 @@ if(MINICONET_BUILD_EXAMPLES)
     )
     list(REMOVE_ITEM MINICONET_TEST_SOURCES
         ${MINICONET_HTTP_PARSER_TESTS} ${MINICONET_WORKPOOL_TESTS} ${MINICONET_UPNP_TESTS}
+        ${MINICONET_BLOCKPOOL_TESTS}
+        ${MINICONET_PMP_TESTS}
         ${MINICONET_BENCH_HTTP_TESTS} ${MINICONET_IOCP_TESTS})
 
     foreach(test_src ${MINICONET_TEST_SOURCES})
@@ -471,48 +516,48 @@ if(MINICONET_BUILD_EXAMPLES)
         endforeach()
     endif()
 
+    # 同构冒烟测试（链接单个库、30s 超时、工作目录为源码根）的公共骨架：
+    # workpool/iocp/upnp/pmp 四组只有链接的库不同。
+    function(miniconet_add_smoke_test test_src link_lib)
+        if(EXISTS ${test_src})
+            get_filename_component(test_name ${test_src} NAME_WE)
+            add_executable(${test_name} ${test_src})
+            target_link_libraries(${test_name} PRIVATE ${link_lib})
+            add_test(NAME ${test_name} COMMAND ${test_name})
+            set_tests_properties(${test_name} PROPERTIES
+                TIMEOUT 30
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            )
+        endif()
+    endfunction()
+
     if(MINICONET_WITH_WORKPOOL)
         foreach(test_src ${MINICONET_WORKPOOL_TESTS})
-            if(EXISTS ${test_src})
-                get_filename_component(test_name ${test_src} NAME_WE)
-                add_executable(${test_name} ${test_src})
-                target_link_libraries(${test_name} PRIVATE miniconet2)
-                add_test(NAME ${test_name} COMMAND ${test_name})
-                set_tests_properties(${test_name} PROPERTIES
-                    TIMEOUT 30
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                )
-            endif()
+            miniconet_add_smoke_test(${test_src} miniconet2)
+        endforeach()
+    endif()
+
+    if(MINICONET_WITH_BLOCKPOOL)
+        foreach(test_src ${MINICONET_BLOCKPOOL_TESTS})
+            miniconet_add_smoke_test(${test_src} miniconet2)
         endforeach()
     endif()
 
     if(MINICONET_WITH_IOCP)
         foreach(test_src ${MINICONET_IOCP_TESTS})
-            if(EXISTS ${test_src})
-                get_filename_component(test_name ${test_src} NAME_WE)
-                add_executable(${test_name} ${test_src})
-                target_link_libraries(${test_name} PRIVATE miniconet2)
-                add_test(NAME ${test_name} COMMAND ${test_name})
-                set_tests_properties(${test_name} PROPERTIES
-                    TIMEOUT 30
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                )
-            endif()
+            miniconet_add_smoke_test(${test_src} miniconet2)
         endforeach()
     endif()
 
     if(MINICONET_WITH_UPNP_CLIENT)
         foreach(test_src ${MINICONET_UPNP_TESTS})
-            if(EXISTS ${test_src})
-                get_filename_component(test_name ${test_src} NAME_WE)
-                add_executable(${test_name} ${test_src})
-                target_link_libraries(${test_name} PRIVATE miniconet2_upnp)
-                add_test(NAME ${test_name} COMMAND ${test_name})
-                set_tests_properties(${test_name} PROPERTIES
-                    TIMEOUT 30
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                )
-            endif()
+            miniconet_add_smoke_test(${test_src} miniconet2_upnp)
+        endforeach()
+    endif()
+
+    if(MINICONET_WITH_PMP)
+        foreach(test_src ${MINICONET_PMP_TESTS})
+            miniconet_add_smoke_test(${test_src} miniconet2_pmp)
         endforeach()
     endif()
 
@@ -544,6 +589,8 @@ message(STATUS "miniconet2: crypto utils(md5/sha1) = ${MINICONET_WITH_CRYPTO_UTI
 message(STATUS "miniconet2: idna                   = ${MINICONET_WITH_IDNA}")
 message(STATUS "miniconet2: wrapper utils          = ${MINICONET_WITH_WRAPPER_UTILS}")
 message(STATUS "miniconet2: workpool (multi-vcpu)  = ${MINICONET_WITH_WORKPOOL}")
+message(STATUS "miniconet2: blockpool (blocking)   = ${MINICONET_WITH_BLOCKPOOL}")
+message(STATUS "miniconet2: pmp client (nat-pmp)   = ${MINICONET_WITH_PMP}")
 
 # ---------------------------------------------------------------------------
 # add_subdirectory support: one name for both integration styles.
@@ -555,7 +602,7 @@ message(STATUS "miniconet2: workpool (multi-vcpu)  = ${MINICONET_WITH_WORKPOOL}"
 foreach(_mc_t miniconet2 miniconet2_crypto_utils miniconet2_http_client
         miniconet2_http_parser miniconet2_http_server miniconet2_idna
         miniconet2_kcp miniconet2_miniupnp miniconet2_mqtt_protocol
-        miniconet2_protocol miniconet2_upnp miniconet2_websocket
+        miniconet2_pmp miniconet2_protocol miniconet2_upnp miniconet2_websocket
         miniconet2_wrapper_utils)
     if(TARGET ${_mc_t} AND NOT TARGET miniconet2::${_mc_t})
         add_library(miniconet2::${_mc_t} ALIAS ${_mc_t})
@@ -578,7 +625,7 @@ set(MINICONET_INSTALL_TARGETS miniconet2)
 foreach(_mc_t
         miniconet2_crypto_utils miniconet2_http_client miniconet2_http_parser
         miniconet2_http_server miniconet2_idna miniconet2_kcp miniconet2_miniupnp
-        miniconet2_mqtt_protocol miniconet2_protocol miniconet2_upnp
+        miniconet2_mqtt_protocol miniconet2_pmp miniconet2_protocol miniconet2_upnp
         miniconet2_websocket miniconet2_wrapper_utils)
     if(TARGET ${_mc_t})
         list(APPEND MINICONET_INSTALL_TARGETS ${_mc_t})

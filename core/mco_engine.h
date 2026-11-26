@@ -64,12 +64,23 @@ struct mco_engine_async_ops {
     uint64_t (*submit_accept)(mco_engine_t* e, int fd, mco_engine_async_cb cb, void* ud);
     /* 0 = cancel accepted or op already done; <0 = submit failed */
     int (*submit_cancel)(mco_engine_t* e, uint64_t cookie, void* ud);
+    /* 1 = completion read/write is usable on this engine *instance*; the
+     * runtime probe can say no (old kernel, seccomp). Lets a caller pick the
+     * completion path without submitting a throwaway op.
+     * NULL = assume usable (IOCP: submit_* always work). */
+    int (*usable)(mco_engine_t* e);
     /* Backend identity questions live in mco_accept_uses_async(), not here. */
 };
 
 /* Pick a backend per platform: Linux io_uring (else epoll), BSD/mac kqueue,
  * Windows wepoll, otherwise select. */
 const mco_engine_ops_t* mco_engine_default(void);
+
+/* Backend to retry with when ops->create() fails, or NULL when there is none.
+ * Only the preferred backend has one today (io_uring -> epoll: old kernel,
+ * seccomp, ENOSYS). mco_vcpu_new() consults this only when it picked the
+ * default itself, so a caller-pinned backend still fails loudly. */
+const mco_engine_ops_t* mco_engine_default_fallback(const mco_engine_ops_t* ops);
 
 #ifdef __cplusplus
 }

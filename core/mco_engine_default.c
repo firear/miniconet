@@ -4,27 +4,25 @@
  */
 #include "mco_engine.h"
 #include <stddef.h>
+#ifdef MINICONET_HAVE_GENERATED_CONFIG
+#include "miniconet_generated/miniconet_config.h"
+#else
 #include "miniconet_config.h"
+#endif
 
 #if defined(__linux__)
 const mco_engine_ops_t* mco_engine_epoll_ops(void);
 #if MINICONET_WITH_IO_URING
 const mco_engine_ops_t* mco_engine_uring_ops(void);
 
-const mco_engine_ops_t* mco_engine_default(void) {
-    /* Lazy probe: create a uring engine once, cache io_uring on success and
-     * epoll on failure (old kernel / seccomp / ENOSYS). */
-    static const mco_engine_ops_t* cached = NULL;
-    if (!cached) {
-        mco_engine_t* probe = mco_engine_uring_ops()->create();
-        if (probe) {
-            mco_engine_uring_ops()->destroy(probe);
-            cached = mco_engine_uring_ops();
-        } else {
-            cached = mco_engine_epoll_ops();
-        }
-    }
-    return cached;
+/* No probing here. The io_uring availability check needs a live ring, so it
+ * belongs to create(): selecting by building an engine and immediately
+ * destroying it made every process pay for two rings instead of one. create()
+ * failing is handled by mco_engine_default_fallback() below. */
+const mco_engine_ops_t* mco_engine_default(void) { return mco_engine_uring_ops(); }
+
+const mco_engine_ops_t* mco_engine_default_fallback(const mco_engine_ops_t* ops) {
+    return (ops == mco_engine_uring_ops()) ? mco_engine_epoll_ops() : NULL;
 }
 #else
 const mco_engine_ops_t* mco_engine_default(void) { return mco_engine_epoll_ops(); }
@@ -51,4 +49,13 @@ const mco_engine_ops_t* mco_engine_default(void) { return mco_engine_wepoll_ops(
 const mco_engine_ops_t* mco_engine_select_ops(void);
 const mco_engine_ops_t* mco_engine_default(void) { return mco_engine_select_ops(); }
 
+#endif
+
+/* Only the Linux io_uring preference has a readiness fallback today; every other
+ * platform's default backend is always creatable. */
+#if !defined(__linux__) || !MINICONET_WITH_IO_URING
+const mco_engine_ops_t* mco_engine_default_fallback(const mco_engine_ops_t* ops) {
+    (void)ops;
+    return NULL;
+}
 #endif

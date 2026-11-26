@@ -36,9 +36,12 @@ static int header_name_eq(const struct phr_header* h, const char* name) {
     return 1;
 }
 
-mco_ws_t* mco_ws_connect(const char* host, int port, const char* path, int timeout_ms) {
+/* Client handshake on a connected socket (TCP or TLS). Takes ownership of sock:
+ * on failure it is closed and destroyed. Every client setup ends up here, so
+ * wss / a custom SNI / a proxy need no entry point of their own. */
+mco_ws_t* mco_ws_client_handshake(mco_socket_t* sock, const char* host, int port,
+                                  const char* path, int timeout_ms) {
     mco_deadline_t dl = mco_deadline_after(timeout_ms);
-    mco_socket_t* sock;
     mco_ws_t* ws;
     char key_raw[16];
     char key_b64[32];
@@ -56,7 +59,6 @@ mco_ws_t* mco_ws_connect(const char* host, int port, const char* path, int timeo
     const char* accept_hdr = NULL;
     size_t accept_hdr_len = 0;
 
-    sock = mco_tcp_connect(host, port, mco_deadline_ms(dl), NULL);
     if (!sock) return NULL;
 
     /* 16 random bytes for Sec-WebSocket-Key; rand() is fine, the key only needs
@@ -133,6 +135,14 @@ fail:
     mco_close(sock);
     mco_socket_destroy(sock);
     return NULL;
+}
+
+mco_ws_t* mco_ws_connect(const char* host, int port, const char* path, int timeout_ms) {
+    mco_deadline_t dl = mco_deadline_after(timeout_ms);
+    mco_socket_t* sock = mco_tcp_connect(host, port, mco_deadline_ms(dl), NULL);
+
+    if (!sock) return NULL;
+    return mco_ws_client_handshake(sock, host, port, path, mco_deadline_ms(dl));
 }
 
 /* ---- send ---- */

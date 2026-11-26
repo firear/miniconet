@@ -1,4 +1,5 @@
 #include "../miniconet.h"
+#include "core/mco_vcpu.h"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
