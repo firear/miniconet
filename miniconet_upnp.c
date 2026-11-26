@@ -6,6 +6,7 @@
  * Only built with MINICONET_WITH_UPNP_CLIENT=ON.
  */
 #include "miniconet_upnp.h"
+#include "core/mco_timer.h"   /* mco_deadline_t / mco_deadline_after / mco_deadline_ms */
 #include "miniconet_http.h"
 
 #include "igd_desc_parse.h"

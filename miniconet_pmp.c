@@ -8,6 +8,7 @@
  * Only built with MINICONET_WITH_PMP=ON.
  */
 #include "miniconet_pmp.h"
+#include "core/mco_timer.h"   /* mco_deadline_t / mco_deadline_after / mco_deadline_ms */
 
 #include <stdio.h>
 #include <string.h>

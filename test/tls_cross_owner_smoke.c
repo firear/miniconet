@@ -9,6 +9,7 @@
  *      tls_duplex_smoke.c).
  */
 #include "../miniconet.h"
+#include "../core/mco_vcpu.h"   /* mco_task_self(); internal API, not exposed by miniconet.h */
 #include "../compat/ssl/hssl.h"
 #include <stdio.h>
 #include <string.h>

@@ -1,4 +1,5 @@
 #include "miniconet_http.h"
+#include "core/mco_timer.h"   /* mco_deadline_t / mco_deadline_after / mco_deadline_ms */
 #include "picohttpparser.h"
 #include "compat/hbase.h"
 #include <stdlib.h>

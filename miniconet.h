@@ -9,7 +9,7 @@
 #define MINICONET_H
 
 #include "compat/hsocket.h"
-// #include "core/mco_timer.h"
+// #include "core/mco_timer.h"   /* intentionally not exposed: internal header */
 #ifdef MINICONET_HAVE_GENERATED_CONFIG
 #include "miniconet_generated/miniconet_config.h"
 #else
